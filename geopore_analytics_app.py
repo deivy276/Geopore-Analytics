@@ -65,8 +65,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-VERSION = "1.8.25"
-
+VERSION = '1.8.25.6'
 # Base dashboard (plot/grid) height in px — requested 1.75× increase over prior 640px
 DASHBOARD_HEIGHT_PX = int(640 * 1.75)  # = 1120px
 
@@ -219,6 +218,7 @@ def apply_plot_theme(fig: go.Figure, theme: str = "dark") -> go.Figure:
         font=dict(color=t["font_color"]),
         legend=dict(font=dict(color=t["font_color"])),
         hoverlabel=dict(font=dict(color=t["font_color"])),
+        hovermode="closest",
     )
     fig.update_xaxes(
         gridcolor=t["grid_color"],
@@ -491,10 +491,19 @@ def apply_smart_legend(
             names.append(nm)
         n = len(names)
 
-        # Apply when we have many legend items OR when the figure already uses a top legend
-        # (common in multi-sample plots where titles/legends can overlap).
+        # Respect an explicit "legend below" placement (common in Multi‑Sample plots).
+        # Several plotting functions intentionally place legends below the plot (y < 0)
+        # to keep the title area clean.
         leg = getattr(fig.layout, "legend", None)
         legy = getattr(leg, "y", None) if leg is not None else None
+        try:
+            if legy is not None and float(legy) < 0:
+                return fig
+        except Exception:
+            pass
+
+        # Apply when we have many legend items OR when the figure already uses a top legend
+        # (common in multi-sample plots where titles/legends can overlap).
         legend_at_top = False
         try:
             if legy is not None and float(legy) >= 0.95:
@@ -516,7 +525,9 @@ def apply_smart_legend(
         per_row_guess = max(3, int(900 / max(1, itemwidth)))
         per_row = max(1, min(int(max_items_per_row), per_row_guess))
         rows = int(math.ceil(n / per_row))
-        top_needed = int(base_top + rows * row_height)
+        # Reserve an extra band for the title above the legend rows.
+        title_band = 34
+        top_needed = int(base_top + title_band + rows * row_height)
 
         # Keep existing margins if they're already larger
         m = getattr(fig.layout, "margin", None)
@@ -536,6 +547,13 @@ def apply_smart_legend(
             ),
             margin=dict(t=max(int(t_existing), top_needed)),
         )
+
+        # Ensure title sits clearly above the legend band (avoids overlap).
+        try:
+            if getattr(fig.layout, "title", None) is not None:
+                fig.update_layout(title=dict(y=1.18, yanchor="top", x=0.01, xanchor="left"))
+        except Exception:
+            pass
 
     except Exception:
         return fig
@@ -1161,7 +1179,13 @@ def _parse_logn4_sheet(df_raw):
             g = prev.iloc[j]
             if g is not None and not (isinstance(g, float) and np.isnan(g)):
                 gname = re.sub(r"\s+", " ", str(g).strip())
-                if gname and gname.lower() not in {"nan", "none"} and gname != name and gname not in name:
+                if (
+                    gname
+                    and gname.lower() not in {"nan", "none"}
+                    and gname != name
+                    and gname not in name
+                    and (" " in name)
+                ):
                     # e.g., "Saturation" + "Oil" -> "Saturation Oil"
                     name = f"{gname} {name}"
         colnames.append(name)
@@ -1201,35 +1225,80 @@ def _parse_logn4_sheet(df_raw):
 
 
 def _read_logn4_from_excel_bytes(decoded, filename=""):
-    """
-    Read LogN4A / LogN4_Vert sheets (if present) from an uploaded Excel file.
-    Returns dict: {sheet_name: parsed_dataframe}
+    """Parse external core-log Excel workbooks into {sheet_name: DataFrame}.
+
+    The parser is intentionally permissive: any sheet that contains a usable **Depth** column and at
+    least one additional log column will be imported.
+
+    This supports:
+    - Classic LogN4 sheets (LogN4A / LogN4_Vert)
+    - Plug/property tables (e.g., Helium porosity, Gas/Air permeability, Klinkenberg)
+
+    The returned data is later merged into the store-logn4 structure by `_merge_logn4_store`.
     """
     out = {}
     if not decoded:
         return out
 
     bio = io.BytesIO(decoded)
+
+    def _try_parse(raw_df):
+        df = _parse_logn4_sheet(raw_df)
+        if df is None or df.empty:
+            return None
+        if "Depth" not in df.columns:
+            return None
+        if len(df.columns) <= 1:
+            return None
+        return df
+
+    # Primary: use ExcelFile (faster + stable for multiple sheets)
     try:
         xl = pd.ExcelFile(bio, engine="openpyxl")
-        sheet_names = set(xl.sheet_names)
-        for sn in ["LogN4A", "LogN4_Vert"]:
-            if sn in sheet_names:
+        for sn in xl.sheet_names:
+            try:
                 raw = pd.read_excel(xl, sheet_name=sn, header=None)
-                out[sn] = _parse_logn4_sheet(raw)
+            except Exception:
+                continue
+            df = _try_parse(raw)
+            if df is not None:
+                out[sn] = df
         return out
-    except Exception as e:
-        # Fallback: try direct read_excel
+    except Exception:
+        pass
+
+    # Fallback: best-effort direct reads
+    try:
+        bio.seek(0)
+    except Exception:
+        pass
+    try:
         try:
-            for sn in ["LogN4A", "LogN4_Vert"]:
-                try:
-                    raw = pd.read_excel(bio, sheet_name=sn, header=None)
-                except Exception:
-                    continue
-                out[sn] = _parse_logn4_sheet(raw)
-            return out
+            bio.seek(0)
         except Exception:
-            return out
+            pass
+        xl2 = pd.ExcelFile(bio)
+        sheet_names = xl2.sheet_names
+    except Exception:
+        sheet_names = []
+
+    if not sheet_names:
+        sheet_names = ["LogN4A", "LogN4_Vert"]
+
+    for sn in sheet_names:
+        try:
+            try:
+                bio.seek(0)
+            except Exception:
+                pass
+            raw = pd.read_excel(bio, sheet_name=sn, header=None)
+        except Exception:
+            continue
+        df = _try_parse(raw)
+        if df is not None:
+            out[sn] = df
+
+    return out
 
 
 def _merge_logn4_store(store, new_sheets, filename=""):
@@ -1403,6 +1472,96 @@ def _find_nearest_logn4_record(logn4_store: dict, sheet_name: str, target_depth:
     idx = diffs.idxmin()
     row = df2.loc[idx]
     return row.to_dict(), float(row["__depth__"]), float(diffs.loc[idx])
+
+
+def _parse_external_perm_row(row: dict) -> dict:
+    """Extract permeability-related values from an arbitrary external-log row dict."""
+    out: dict = {}
+    if not isinstance(row, dict):
+        return out
+
+    for k, v in row.items():
+        lk = str(k).strip().lower()
+        val = _num(v)
+        if val is None:
+            continue
+
+        # Ambient / Overburden permeability (LogN4 style)
+        if "permamb" in lk:
+            out["permamb_md"] = val
+            continue
+        if "permob" in lk:
+            out["permob_md"] = val
+            continue
+
+        # Klinkenberg-corrected permeability
+        if "klink" in lk:
+            out["k_klinkenberg_md"] = val
+            continue
+
+        # Gas / air / helium permeability (various naming conventions)
+        if ("permeability" in lk and ("air" in lk or "gas" in lk or "helium" in lk)) or lk in {"kair", "k_air", "k-air"}:
+            out["k_air_md"] = val
+            continue
+        if "helium" in lk and "perm" in lk:
+            out["k_helium_md"] = val
+            continue
+
+    # Many datasets report only gas/air permeability + Klinkenberg; treat gas/air as "helium" if helium is missing.
+    if "k_helium_md" not in out and "k_air_md" in out:
+        out["k_helium_md"] = out["k_air_md"]
+
+    return out
+
+
+def _best_external_perm_at_depth(logn4_store: dict, depth_ft: float | None) -> dict:
+    """Best-effort lookup of external permeability values near a given depth.
+
+    Searches across all imported sheets and returns a dict with (some of):
+      - permamb_md, permob_md
+      - k_air_md, k_helium_md
+      - k_klinkenberg_md
+
+    Selection strategy:
+      1) Prefer sheets that provide more of these values.
+      2) Break ties using smallest |Depth - depth_ft|.
+    """
+    sheets = (logn4_store or {}).get("sheets", {}) or {}
+    depth_ft = _num(depth_ft)
+    if depth_ft is None or not sheets:
+        return {}
+
+    best_vals: dict = {}
+    best_score = -1
+    best_dist = None
+
+    for sheet_name, sh in sheets.items():
+        cols = sh.get("columns") or []
+        cols_low = [str(c).lower() for c in cols]
+        if not any(("perm" in c or "klink" in c or "permeability" in c) for c in cols_low):
+            continue
+
+        rec, actual_depth, _delta = _find_nearest_logn4_record(logn4_store, sheet_name, depth_ft)
+        if not rec:
+            continue
+
+        vals = _parse_external_perm_row(rec)
+        if not vals:
+            continue
+
+        score = sum(1 for k in ("k_klinkenberg_md", "k_air_md", "k_helium_md", "permamb_md", "permob_md") if vals.get(k) is not None)
+        dist = None
+        ad = _num(actual_depth)
+        if ad is not None:
+            dist = abs(ad - depth_ft)
+
+        if score > best_score or (score == best_score and dist is not None and (best_dist is None or dist < best_dist)):
+            best_vals = vals
+            best_score = score
+            best_dist = dist
+
+    return best_vals
+
 
 
 def _safe_div(a, b):
@@ -2987,6 +3146,118 @@ def _interp_pc_at_fraction(df: pd.DataFrame, frac_target: float) -> Optional[flo
     logpc = logpc0 + t * (logpc1 - logpc0)
     return float(10 ** logpc)
 
+
+def _collapse_depth_duplicates(depth: np.ndarray, x: np.ndarray, ndigits: int = 2, agg: str = "median"):
+    """Collapse duplicate (or near-duplicate) depth samples into a single representative value.
+
+    Why:
+      Core plug datasets often contain multiple plugs at the *same* depth. If we connect
+      those points as a line, Plotly draws misleading horizontal segments.
+
+    Strategy:
+      - Round depth to `ndigits` (meters) and aggregate `x` per rounded depth.
+      - Default aggregation is median (robust to outliers).
+    """
+    if depth is None or x is None:
+        return np.array([]), np.array([])
+
+    d = np.asarray(depth, dtype=float)
+    v = np.asarray(x, dtype=float)
+    m = np.isfinite(d) & np.isfinite(v)
+    d = d[m]
+    v = v[m]
+    if len(d) == 0:
+        return np.array([]), np.array([])
+
+    df = pd.DataFrame({"depth": d, "x": v})
+    df["depth_bin"] = df["depth"].round(int(ndigits))
+
+    if agg == "mean":
+        g = df.groupby("depth_bin", as_index=False)["x"].mean()
+    elif agg == "min":
+        g = df.groupby("depth_bin", as_index=False)["x"].min()
+    elif agg == "max":
+        g = df.groupby("depth_bin", as_index=False)["x"].max()
+    else:
+        g = df.groupby("depth_bin", as_index=False)["x"].median()
+
+    g = g.sort_values("depth_bin")
+    return g["depth_bin"].to_numpy(dtype=float), g["x"].to_numpy(dtype=float)
+
+
+def _auto_gap_break_m(depth: np.ndarray, min_gap: float = 10.0, max_gap: float = 50.0) -> float:
+    """Heuristic depth gap (m) above which we break line connections."""
+    d = np.asarray(depth, dtype=float)
+    d = d[np.isfinite(d)]
+    if len(d) < 4:
+        return float(min_gap)
+    d = np.sort(d)
+    diffs = np.diff(d)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if len(diffs) == 0:
+        return float(min_gap)
+
+    q75 = float(np.percentile(diffs, 75))
+    gap = max(min_gap, 3.0 * q75)
+    gap = min(max_gap, gap)
+    return float(gap)
+
+
+def _split_by_depth_gap(depth: np.ndarray, x: np.ndarray, gap_m: float):
+    """Split a (depth, x) series into segments where depth gaps exceed `gap_m`."""
+    d = np.asarray(depth, dtype=float)
+    v = np.asarray(x, dtype=float)
+    if len(d) == 0:
+        return []
+    if len(d) == 1:
+        return [(d, v)]
+
+    order = np.argsort(d)
+    d = d[order]
+    v = v[order]
+
+    segments = []
+    start = 0
+    for i in range(1, len(d)):
+        if (d[i] - d[i - 1]) > gap_m:
+            segments.append((d[start:i], v[start:i]))
+            start = i
+    segments.append((d[start:], v[start:]))
+    return segments
+
+
+def _interp_logk(depth: np.ndarray, k: np.ndarray, step_m: Optional[float] = None, max_points: int = 800):
+    """Interpolate permeability along depth in log10(k) space."""
+    d = np.asarray(depth, dtype=float)
+    kk = np.asarray(k, dtype=float)
+    m = np.isfinite(d) & np.isfinite(kk) & (kk > 0)
+    d = d[m]
+    kk = kk[m]
+    if len(d) < 2:
+        return d, kk
+
+    order = np.argsort(d)
+    d = d[order]
+    kk = kk[order]
+
+    diffs = np.diff(d)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if step_m is None:
+        step_m = float(max(0.25, (np.median(diffs) / 4.0) if len(diffs) else 0.25))
+
+    dmin, dmax = float(d.min()), float(d.max())
+    if dmax <= dmin:
+        return d, kk
+
+    n = int((dmax - dmin) / float(step_m)) + 1
+    n = max(len(d), min(int(max_points), n))
+    d_new = np.linspace(dmin, dmax, n)
+
+    logk = np.log10(kk)
+    logk_new = np.interp(d_new, d, logk)
+    k_new = np.power(10.0, logk_new)
+    return d_new, k_new
+
 def compute_r_um_at_hgsat_fraction(df: pd.DataFrame, params: Dict[str, Any], frac_target: float) -> Optional[float]:
     """Compute pore throat *radius* (µm) at a target cumulative Hg saturation fraction.
 
@@ -4335,6 +4606,7 @@ def cluster_library(library: List[Dict[str, Any]], params: Dict[str, Any]) -> Li
 # ---------------------------
 import plotly.graph_objects as go
 
+from plotly.subplots import make_subplots
 def fig_intrusion(df: pd.DataFrame, ui: Dict[str, Any]) -> go.Figure:
     d = df.copy()
     fig = go.Figure()
@@ -4993,6 +5265,48 @@ def _sample_label(sample):
 
 
 
+
+def _is_excluded_sample_for_multisample(sample, params):
+    """Return True if a sample should be hidden from multi-sample plots by default.
+
+    Rules:
+    - User decision DISCARDED -> excluded
+    - PetroQC hard-fail (grade FAIL) -> excluded
+    - If PetroQC results are not present yet, we attempt a lightweight PetroQC evaluation
+      (best effort; failures will default to *not* excluding).
+    """
+    try:
+        if not isinstance(sample, dict):
+            return False
+        res = sample.get('results', {}) or {}
+        if isinstance(res, dict):
+            dec = (res.get('sample_decision') or '').strip().upper()
+            if dec == 'DISCARDED':
+                return True
+            if bool(res.get('exclude_from_shm')):
+                return True
+            grade = (res.get('petro_qc_grade') or '').strip().upper()
+            if grade == 'FAIL':
+                return True
+
+        # If PetroQC has not been run yet, attempt a best-effort evaluation
+        meta = sample.get('meta', {}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        df = _df_from_sample(sample)
+        if df is None or df.empty:
+            return False
+        df = _ensure_schema(df)
+        res_tmp = dict(res) if isinstance(res, dict) else {}
+        try:
+            petrophysical_qaqc(meta, params or {}, df=df, res=res_tmp)
+        except Exception:
+            return False
+        grade2 = (res_tmp.get('petro_qc_grade') or '').strip().upper()
+        return grade2 == 'FAIL'
+    except Exception:
+        return False
+
 def _select_k_md(meta, res):
     """Pick a representative permeability (mD) for plots (core if present, else MICP-derived)."""
     # prefer measured/core permeability
@@ -5026,10 +5340,10 @@ def _select_k_md(meta, res):
     return None, "n/a"
 
 
-def fig_ms_pc_overlay(library, ui, highlight_id=None):
+def fig_ms_pc_overlay(library_ms, ui, highlight_id=None):
     """Multi-sample Pc vs Sw overlay."""
     ui = ui or {}
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
     fig = go.Figure()
 
     xlog = bool(ui.get("xlog", True))
@@ -5088,10 +5402,10 @@ def fig_ms_pc_overlay(library, ui, highlight_id=None):
     return fig
 
 
-def fig_ms_cum_intrusion(library, ui, highlight_id=None):
+def fig_ms_cum_intrusion(library_ms, ui, highlight_id=None):
     """Multi-sample cumulative intrusion vs pressure."""
     ui = ui or {}
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
     fig = go.Figure()
     xlog = bool(ui.get("xlog", True))
 
@@ -5143,10 +5457,10 @@ def fig_ms_cum_intrusion(library, ui, highlight_id=None):
     return fig
 
 
-def fig_ms_psd_compare(library, ui, highlight_id=None):
+def fig_ms_psd_compare(library_ms, ui, highlight_id=None):
     """Multi-sample PSD (dV/dlog(r)) comparison."""
     ui = ui or {}
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
     fig = go.Figure()
     xlog = bool(ui.get("xlog", True))
 
@@ -5189,10 +5503,10 @@ def fig_ms_psd_compare(library, ui, highlight_id=None):
     return fig
 
 
-def fig_ms_phi_k_crossplot(library, params, highlight_id=None):
+def fig_ms_phi_k_crossplot(library_ms, params, highlight_id=None):
     """Porosity vs Permeability (multi-sample)."""
     params = params or DEFAULT_PARAMS
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
 
     rows = []
     for s in samples:
@@ -5229,38 +5543,51 @@ def fig_ms_phi_k_crossplot(library, params, highlight_id=None):
         )
         return fig
 
-    # Highlighted sample (bigger marker)
-    sizes = []
-    for sid in dfp["id"].tolist():
-        sizes.append(14 if (highlight_id is not None and sid == highlight_id) else 9)
-
-    fig.add_trace(
-        go.Scatter(
-            x=dfp["porosity_pct"],
-            y=dfp["k_md"],
-            mode="markers",
-            marker=dict(size=sizes),
-            text=dfp["label"],
-            hovertemplate="Sample=%{text}<br>ϕ=%{x:.2f}%<br>k=%{y:.3g} mD<br>k_method=%{customdata}<extra></extra>",
-            customdata=dfp["k_method"],
-            name="Samples",
+    # One trace per sample so the legend shows sample names (industry-style QC).
+    for _, r in dfp.iterrows():
+        sid = r.get("id")
+        label = r.get("label")
+        size = 14 if (highlight_id is not None and sid == highlight_id) else 9
+        fig.add_trace(
+            go.Scatter(
+                x=[r.get("porosity_pct")],
+                y=[r.get("k_md")],
+                mode="markers",
+                name=label,
+                marker=dict(size=size),
+                customdata=[r.get("k_method")],
+                hovertemplate=(
+                    "Sample=%{fullData.name}<br>"
+                    "ϕ=%{x:.2f}%<br>"
+                    "k=%{y:.3g} mD<br>"
+                    "k_method=%{customdata}<extra></extra>"
+                ),
+                showlegend=True,
+            )
         )
-    )
 
     fig.update_layout(
         template="plotly_dark",
         title="Porosity vs. Permeability Crossplot",
-        margin=dict(l=55, r=25, t=45, b=120),
+        margin=dict(l=55, r=25, t=45, b=140),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.22,
+            xanchor="left",
+            x=0.0,
+            font=dict(size=10),
+        ),
     )
     fig.update_xaxes(title="Porosity (%)")
     fig.update_yaxes(title="Permeability (mD)", type="log")
     return fig
 
 
-def fig_ms_j_function(library, params, highlight_id=None):
+def fig_ms_j_function(library_ms, params, highlight_id=None):
     """Leverett J-function plot (multi-sample)."""
     params = params or DEFAULT_PARAMS
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
     fig = go.Figure()
 
     for s in samples:
@@ -5348,6 +5675,8 @@ def _sample_phi_k(sample: dict):
     # Permeability in mD
     k_md = (
         _safe_float(meta.get("permeability_md"))
+        or _safe_float(res.get("permeability_md"))
+        or _safe_float(res.get("perm_md"))
         or _safe_float(res.get("k_air_md"))
         or _safe_float(res.get("k_swanson_md"))
         or _safe_float(res.get("k_winland_md"))
@@ -5364,8 +5693,16 @@ def _compute_sample_j_curve(sample: dict, params: dict):
     if phi is None or k_md is None or phi <= 0 or k_md <= 0:
         return None, None
 
-    raw = sample.get("raw", None)
-    df = pd.DataFrame(raw) if raw is not None else pd.DataFrame()
+    # NOTE: the app stores the MICP table as list-of-dicts in "data" (processed)
+    # and "data_raw" (unprocessed). Earlier versions used the key "raw".
+    # SHM/J-curves require the actual MICP table.
+    records = sample.get("data", None)
+    if records is None:
+        records = sample.get("data_raw", None)
+    if records is None:
+        records = sample.get("raw", None)
+
+    df = pd.DataFrame(records) if records is not None else pd.DataFrame()
     if df.empty:
         return None, None
 
@@ -5571,9 +5908,9 @@ def fig_ms_shm_curves(library: dict, params: dict, ui: dict):
     )
     fig.update_yaxes(range=[0, 1])
     return fig
-def fig_ms_g_vs_pd(library, highlight_id=None):
+def fig_ms_g_vs_pd(library_ms, highlight_id=None):
     """Pore geometry factor (G) vs Pd crossplot."""
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
     rows = []
 
     for s in samples:
@@ -5630,38 +5967,59 @@ def fig_ms_g_vs_pd(library, highlight_id=None):
         )
         return fig
 
-    # separate traces by component
-    for comp, sym in [("uni", "circle"), ("macro", "diamond"), ("micro", "square")]:
-        sub = dfp[dfp["component"] == comp]
-        if sub.empty:
-            continue
-        sizes = [14 if (highlight_id is not None and sid == highlight_id) else 9 for sid in sub["id"].tolist()]
+    # One trace per sample so the legend shows sample names.
+    # We keep component information via marker symbols + hover.
+    sym_map = {"uni": "circle", "macro": "diamond", "micro": "square"}
+    for sid, sub in dfp.groupby("id"):
+        try:
+            label = str(sub["label"].iloc[0])
+        except Exception:
+            label = str(sid)
+
+        comps = sub["component"].tolist()
+        symbols = [sym_map.get(c, "circle") for c in comps]
+        size = 14 if (highlight_id is not None and sid == highlight_id) else 9
+
         fig.add_trace(
             go.Scatter(
                 x=sub["pd_psia"],
                 y=sub["G"],
                 mode="markers",
-                name=f"{comp}",
-                marker=dict(symbol=sym, size=sizes),
-                text=sub["label"],
-                hovertemplate="Sample=%{text}<br>Pd=%{x:.3g} psia<br>G=%{y:.3g}<br>comp=%{fullData.name}<extra></extra>",
+                name=label,
+                marker=dict(symbol=symbols, size=size),
+                customdata=comps,
+                hovertemplate=(
+                    "Sample=%{fullData.name}<br>"
+                    "comp=%{customdata}<br>"
+                    "Pd=%{x:.3g} psia<br>"
+                    "G=%{y:.3g}<extra></extra>"
+                ),
+                showlegend=True,
             )
         )
 
     fig.update_layout(
         template="plotly_dark",
         title="Pore Geometry Factor (G) vs Pd",
-        margin=dict(l=55, r=25, t=45, b=120),
+        margin=dict(l=55, r=25, t=45, b=140),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.22,
+            xanchor="left",
+            x=0.0,
+            font=dict(size=10),
+        ),
     )
     fig.update_xaxes(title="Pd (psia)", type="log")
     fig.update_yaxes(title="G (dimensionless)")
     return fig
 
 
-def fig_ms_petro_logs(library, params):
+def fig_ms_petro_logs(library_ms, params):
     """Multi-sample petrophysical log with DEPTH on Y (increasing downward)."""
     params = params or DEFAULT_PARAMS
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
 
     rows = []
     for s in samples:
@@ -5755,7 +6113,7 @@ def fig_ms_petro_logs(library, params):
 
 
 
-def _collect_ms_k_profiles(library):
+def _collect_ms_k_profiles(library, logn4_store=None):
     """Build a depth-indexed DataFrame with permeability/porosity profiles across the current library.
 
     This is used by the Multi-Sample 'k Profile' plot (well-log style). It intentionally tolerates
@@ -5810,7 +6168,7 @@ def _collect_ms_k_profiles(library):
             or meta.get("helium_md")
         )
 
-        # External N4 Logs permeabilities (if stored in meta/results)
+        # External Core Logs permeabilities (if stored in meta/results)
         permamb_md = _safe_float(
             res.get("permamb_md")
             or meta.get("permamb_md")
@@ -5824,9 +6182,31 @@ def _collect_ms_k_profiles(library):
             or meta.get("Perm_OB")
         )
 
+        # Best-effort enrichment from External Core Logs (e.g., Helium / Klinkenberg permeability sheets)
+        depth_ft = _safe_float(meta.get("depth_ft"))
+        if depth_ft is None and depth_m is not None:
+            # Meta depth is commonly stored in meters; external logs are typically in feet
+            try:
+                depth_ft = float(depth_m) / 0.3048
+            except Exception:
+                depth_ft = None
+        ext = _best_external_perm_at_depth(logn4_store, depth_ft) if logn4_store else {}
+        if ext:
+            if permamb_md is None:
+                permamb_md = ext.get("permamb_md")
+            if permob_md is None:
+                permob_md = ext.get("permob_md")
+            if k_air_md is None:
+                k_air_md = ext.get("k_air_md")
+            if k_klinkenberg_md is None:
+                k_klinkenberg_md = ext.get("k_klinkenberg_md")
+            if k_helium_md is None:
+                k_helium_md = ext.get("k_helium_md") or ext.get("k_air_md")
+
         rows.append(
             {
                 "depth_m": depth_m,
+                "sample_id": _sample_label(s),
                 "phi_frac": phi_frac,
                 "k_pnm_md": k_pnm_md,
                 "k_pnm_fast_md": k_pnm_fast_md,
@@ -5859,197 +6239,267 @@ def _collect_ms_k_profiles(library):
         df["k_winland_macro_md"] = df["k_winland_md"]
     return df
 
-def fig_ms_k_profile(library, mode="logk", fill_models=False) -> go.Figure:
+def fig_ms_k_profile(library, mode: str = "logk", fill_models: bool = False, logn4_store: dict | None = None):
+    """Multi-sample k profile rendered as well-log style tracks.
+
+    Tracks (default):
+      - Measured k (core / Helium / Klinkenberg / N4 Perm)
+      - Empirical models (Swanson / Winland)
+      - PNM (PNM k)
+
+    Notes
+    -----
+    - If mode == 'logk': model traces are drawn as lines (visual log(k) interpolation on log-x axis).
+    - If mode == 'raw': everything is shown as raw points (markers).
+    - Depth gaps larger than `kprof_gap_break_m` (from UI store when present) are broken so lines don't
+      artificially connect across missing intervals.
     """
-    Multi-sample permeability profile rendered as a "well‑log style" track.
 
-    - X axis: permeability (mD) on a log scale
-    - Y axis: depth (m), increasing downward
+    profiles = _collect_ms_k_profiles(library, logn4_store=logn4_store)
 
-    Convention:
-    - Model curves (PNM / Winland variants, etc.) are drawn as lines.
-    - Measured core k (Helium/Klinkenberg/PermAmb/PermOB, etc.) are drawn as markers.
-    """
-    dfp = _collect_ms_k_profiles(library)
-    if dfp is None or getattr(dfp, "empty", True):
-        return _empty_fig("No k profile data.")
+    if profiles is None or profiles.empty:
+        return _empty_fig("No k profile data available.")
 
-    if "depth_m" not in dfp.columns:
-        return _empty_fig("No depth data for k profile.")
+    # --- Column map (DataFrame column names) ---
+    keymap = {
+        "Core k": "k_core_md",
+        "Helium k": "k_helium_md",
+        "Klinkenberg k": "k_klinkenberg_md",
+        "PermOB (N4)": "permob_md",
+        "PermAmb (N4)": "permamb_md",
+        "PermOB (SC)": "permob_sc_md",
+        "PermAmb (SC)": "permamb_sc_md",
+        "Swanson": "k_swanson_md",
+        "Winland (macro)": "k_winland_macro_md",
+        "PNM k": "k_pnm_md",
+    }
 
-    dfp = dfp.copy()
-    dfp = dfp.dropna(subset=["depth_m"])
-    if dfp.empty:
-        return _empty_fig("No depth data for k profile.")
-
-    dfp = dfp.sort_values("depth_m")
-
-    # Candidate k columns (mD). Keep only JSON/float friendly.
-    kcols = [
-        c
-        for c in dfp.columns
-        if c.startswith("k_") and c.endswith("_md") and c != "k_profile_color"
+    # Track grouping (readability-first)
+    track_defs = [
+        ("Measured", ["Core k", "Helium k", "Klinkenberg k", "PermOB (N4)", "PermAmb (N4)", "PermOB (SC)", "PermAmb (SC)"]),
+        ("Empirical models", ["Swanson", "Winland (macro)"]),
+        ("PNM", ["PNM k"]),
     ]
-    if not kcols:
-        return _empty_fig("No permeability curves available for k profile.")
 
-    # Compute global min/max for tick decades (log axis => positive only)
-    all_pos = []
-    for c in kcols:
-        s = pd.to_numeric(dfp[c], errors="coerce")
-        s = s[(s > 0) & s.notna()]
-        if not s.empty:
-            all_pos.append(s)
-    if not all_pos:
-        return _empty_fig("No positive permeability values for k profile.")
+    # Determine available series
+    available_labels = []
+    for label, col in keymap.items():
+        if col in profiles.columns and profiles[col].notna().any():
+            available_labels.append(label)
 
-    all_pos = pd.concat(all_pos, ignore_index=True)
-    kmin = float(all_pos.min())
-    kmax = float(all_pos.max())
+    if not available_labels:
+        return _empty_fig("No k profile data available.")
 
-    lo = int(math.floor(math.log10(kmin))) if kmin > 0 else -3
-    hi = int(math.ceil(math.log10(kmax))) if kmax > 0 else 3
-    lo = max(lo, -6)
-    hi = min(hi, 8)
+    # Filter tracks to only those with at least one available series
+    tracks = []
+    for tname, labels in track_defs:
+        present = [lbl for lbl in labels if lbl in available_labels]
+        if present:
+            tracks.append((tname, present))
 
-    tickvals = [10 ** i for i in range(lo, hi + 1)]
-    ticktext = []
-    for v in tickvals:
-        if v >= 1:
-            ticktext.append(f"{v:g}")
+    if not tracks:
+        return _empty_fig("No k profile data available.")
+
+    # Range for log-x axis
+    k_cols_present = [keymap[lbl] for lbl in available_labels if keymap[lbl] in profiles.columns]
+    all_vals = []
+    for c in k_cols_present:
+        v = profiles[c]
+        if v is not None:
+            all_vals.append(v)
+
+    import numpy as np
+
+    if all_vals:
+        vv = np.concatenate([np.asarray(s.dropna().values, dtype=float) for s in all_vals if hasattr(s, 'dropna')])
+        vv = vv[np.isfinite(vv) & (vv > 0)]
+        if vv.size:
+            k_min = float(np.nanpercentile(vv, 1))
+            k_max = float(np.nanpercentile(vv, 99))
         else:
-            ticktext.append(f"{v:.3g}")
+            k_min, k_max = 0.1, 1000.0
+    else:
+        k_min, k_max = 0.1, 1000.0
 
-    # Determine which curves are "measured" vs "models"
-    measured_tags = ("helium", "klinkenberg", "core", "air", "permamb", "permob")
-    measured_cols = [c for c in kcols if any(t in c.lower() for t in measured_tags)]
-    model_cols = [c for c in kcols if c not in measured_cols]
+    # Safety
+    if not np.isfinite(k_min) or k_min <= 0:
+        k_min = 0.1
+    if not np.isfinite(k_max) or k_max <= k_min:
+        k_max = max(k_min * 10.0, 1000.0)
 
-    # Stable display order (preferred first, then anything else)
-    preferred_order = [
-        "k_pnm_md",
-        "k_pnm_fast_md",
-        "k_winland_macro_md",
-        "k_winland_bimodal_md",
-        "k_winland_md",
-        "k_core_md",
-        "k_air_md",
-        "k_klinkenberg_md",
-        "k_helium_md",
-        "k_permamb_md",
-        "k_permob_md",
-    ]
-    ordered = [c for c in preferred_order if c in kcols]
-    ordered += [c for c in kcols if c not in ordered]
+    # decade ticks (industry standard: 0.01 / 0.1 / 1 / 10 / 100 / 1000 ...)
+    d0 = int(np.floor(np.log10(k_min)))
+    d1 = int(np.ceil(np.log10(k_max)))
+    decades = list(range(d0, d1 + 1))
+    tick_vals = [10 ** d for d in decades]
 
-    # x-min baseline for fills (log axis can't fill to 0)
-    xmin_fill = 10 ** (lo - 1)
+    # Depth gap breaking threshold (optional UI store)
+    gap_break_m = 6.0
+    try:
+        if isinstance(logn4_store, dict):
+            ui = (logn4_store.get('_ui', {}) or {})
+            gap_break_m = float(ui.get('kprof_gap_break_m', gap_break_m))
+    except Exception:
+        pass
 
-    fig = go.Figure()
+    def _break_on_gaps(y_depth, x_k, meta_text, gap_m: float):
+        """Insert None breaks when depth gaps are large (for line traces)."""
+        if gap_m is None or gap_m <= 0 or len(y_depth) < 2:
+            return x_k, y_depth, meta_text
+        xo, yo, to = [], [], []
+        last_y = None
+        for xi, yi, ti in zip(x_k, y_depth, meta_text):
+            if last_y is not None and yi is not None and abs(float(yi) - float(last_y)) > gap_m:
+                xo.append(None); yo.append(None); to.append(None)
+            xo.append(xi); yo.append(yi); to.append(ti)
+            last_y = yi
+        return xo, yo, to
 
-    def _pretty_name(col: str) -> str:
-        name = col.replace("k_", "").replace("_md", "").replace("_", " ").strip()
-        return name.title()
+    # Styling
+    style_map = {
+        "Core k": dict(color="#00E5FF", width=0, symbol="circle"),
+        "Helium k": dict(color="#FFD54F", width=0, symbol="diamond"),
+        "Klinkenberg k": dict(color="#FFA726", width=0, symbol="diamond"),
+        "PermOB (N4)": dict(color="#90CAF9", width=0, symbol="square"),
+        "PermAmb (N4)": dict(color="#64B5F6", width=0, symbol="square"),
+        "PermOB (SC)": dict(color="#BBDEFB", width=0, symbol="square-open"),
+        "PermAmb (SC)": dict(color="#64B5F6", width=0, symbol="square-open"),
+        "Swanson": dict(color="#00FF66", width=2, dash="solid"),
+        "Winland (macro)": dict(color="#00FF66", width=2, dash="dash"),
+        "PNM k": dict(color="#FF00FF", width=2, dash="solid"),
+    }
 
-    for col in ordered:
-        s = pd.to_numeric(dfp[col], errors="coerce")
-        mask = s.notna() & (s > 0) & dfp["depth_m"].notna()
-        if not mask.any():
-            continue
+    measured_labels = {"Core k", "Helium k", "Klinkenberg k", "PermOB (N4)", "PermAmb (N4)", "PermOB (SC)", "PermAmb (SC)"}
 
-        x = s[mask].astype(float)
-        y = dfp.loc[mask, "depth_m"].astype(float)
-        name = _pretty_name(col)
-        is_measured = col in measured_cols
+    # Create track subplots
+    fig = make_subplots(
+        rows=1,
+        cols=len(tracks),
+        shared_yaxes=True,
+        horizontal_spacing=0.035,
+        subplot_titles=[t[0] for t in tracks],
+    )
 
-        if is_measured:
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="markers",
-                    name=name,
-                    marker=dict(size=7),
-                    hovertemplate="Depth=%{y:.2f} m<br>k=%{x:.3g} mD<extra>" + name + "</extra>",
-                )
+    # Add traces per track
+    for cidx, (tname, labels) in enumerate(tracks, start=1):
+        for label in labels:
+            col = keymap[label]
+            df = profiles[["depth_m", "sample_id", col]].dropna()
+            if df.empty:
+                continue
+
+            y = df["depth_m"].astype(float).tolist()
+            x = df[col].astype(float).tolist()
+            txt = df["sample_id"].astype(str).tolist()
+
+            # Keep only positive k values for log axis
+            x2, y2, t2 = [], [], []
+            for xi, yi, ti in zip(x, y, txt):
+                if xi is None:
+                    continue
+                try:
+                    if float(xi) <= 0:
+                        continue
+                except Exception:
+                    continue
+                x2.append(float(xi))
+                y2.append(float(yi))
+                t2.append(ti)
+
+            if not x2:
+                continue
+
+            st = style_map.get(label, {})
+
+            is_measured = label in measured_labels
+            show_line = (not is_measured) and (mode == "logk")
+
+            if show_line:
+                x2, y2, t2 = _break_on_gaps(y2, x2, t2, gap_break_m)
+
+            hover = (
+                "Sample: %{text}<br>"
+                "Depth: %{y:.2f} m<br>"
+                "k: %{x:.3g} mD<extra></extra>"
             )
-            continue
 
-        # Model curves
-        if mode == "raw":
-            # Raw points only (avoid connecting across sparse samples)
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="markers",
-                    name=name,
-                    marker=dict(size=5),
-                    hovertemplate="Depth=%{y:.2f} m<br>k=%{x:.3g} mD<extra>" + name + "</extra>",
+            if is_measured:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x2,
+                        y=y2,
+                        mode="markers",
+                        name=label,
+                        text=t2,
+                        hovertemplate=hover,
+                        marker=dict(size=6, color=st.get("color", "#FFFFFF"), symbol=st.get("symbol", "circle"), line=dict(width=0)),
+                        showlegend=True,
+                    ),
+                    row=1,
+                    col=cidx,
                 )
-            )
-            continue
+            else:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x2,
+                        y=y2,
+                        mode="lines" if show_line else "markers",
+                        name=label,
+                        text=t2,
+                        hovertemplate=hover,
+                        line=dict(color=st.get("color", "#FFFFFF"), width=int(st.get("width", 2)), dash=st.get("dash", "solid")),
+                        marker=dict(size=5, color=st.get("color", "#FFFFFF")),
+                        fill="tozerox" if (fill_models and show_line) else None,
+                        opacity=0.22 if (fill_models and show_line) else 1.0,
+                        showlegend=True,
+                    ),
+                    row=1,
+                    col=cidx,
+                )
 
-        if fill_models:
-            # Baseline (invisible) + filled curve to mimic a shaded well-log track
-            fig.add_trace(
-                go.Scatter(
-                    x=[xmin_fill] * len(y),
-                    y=y,
-                    mode="lines",
-                    line=dict(width=0),
-                    hoverinfo="skip",
-                    showlegend=False,
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="lines",
-                    name=name,
-                    line=dict(width=2),
-                    fill="tonextx",
-                    hovertemplate="Depth=%{y:.2f} m<br>k=%{x:.3g} mD<extra>" + name + "</extra>",
-                )
-            )
-        else:
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="lines",
-                    name=name,
-                    line=dict(width=2),
-                    hovertemplate="Depth=%{y:.2f} m<br>k=%{x:.3g} mD<extra>" + name + "</extra>",
-                )
-            )
+    # Axes configuration
+    x_range = [np.log10(k_min), np.log10(k_max)]
 
-    if len(fig.data) == 0:
-        return _empty_fig("No k profile data to plot.")
+    for cidx in range(1, len(tracks) + 1):
+        fig.update_xaxes(
+            type="log",
+            range=x_range,
+            tickvals=tick_vals,
+            ticktext=[f"{v:g}" for v in tick_vals],
+            showgrid=True,
+            minor=dict(showgrid=True),
+            title_text="Permeability (mD)",
+            row=1,
+            col=cidx,
+        )
+
+    # y-axis on first track only (shared y)
+    fig.update_yaxes(
+        title_text="Depth (m)",
+        autorange="reversed",
+        showgrid=True,
+        row=1,
+        col=1,
+    )
+
+    # Hide y tick labels on other tracks (clean log-track look)
+    for cidx in range(2, len(tracks) + 1):
+        fig.update_yaxes(showticklabels=False, row=1, col=cidx)
 
     fig.update_layout(
-        title=f"k Profile ({'Log(k) interpolation' if mode == 'logk' else 'Raw points'})",
-        xaxis=dict(
-            title="Permeability (mD)",
-            type="log",
-            tickmode="array",
-            tickvals=tickvals,
-            ticktext=ticktext,
-            range=[math.log10(tickvals[0]), math.log10(tickvals[-1])],
-            domain=[0.08, 0.95],
-            showgrid=True,
-        ),
-        yaxis=dict(title="Depth (m)", autorange="reversed", showgrid=True),
-        legend=dict(orientation="h", y=-0.15),
-        margin=dict(l=70, r=25, t=50, b=60),
+        template="plotly_dark",
+        title="k Profile (Well-log tracks)",
+        height=520,
+        margin=dict(l=70, r=25, t=55, b=55),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        hovermode="closest",
     )
-    return fig
 
-def fig_ms_hfu_log(library, params):
+    return fig
+def fig_ms_hfu_log(library_ms, params):
     """Hydraulic Flow Unit (HFU) log using FZI-based classes (DEPTH on Y)."""
     params = params or DEFAULT_PARAMS
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
 
     rows = []
     logfzi_vals = []
@@ -6117,9 +6567,11 @@ def fig_ms_hfu_log(library, params):
         go.Scatter(
             x=dfp["HFU"],
             y=dfp["depth_m"],
-            mode="markers",
+            mode="markers+text",
             marker=dict(size=10, color=dfp["HFU"], colorscale="Turbo", showscale=True, colorbar=dict(title="HFU")),
             text=dfp["label"],
+            textposition="top center",
+            textfont=dict(size=10),
             customdata=np.stack([dfp["FZI"].values, dfp["logFZI"].values], axis=-1),
             hovertemplate="Sample=%{text}<br>Depth=%{y:.2f} m<br>HFU=%{x}<br>FZI=%{customdata[0]:.3g}<br>logFZI=%{customdata[1]:.3g}<extra></extra>",
             name="HFU",
@@ -6466,10 +6918,10 @@ app.index_string = f"""
 """
 
 
-def fig_ms_k_pnm_crossplot(library, params, highlight_id=None):
+def fig_ms_k_pnm_crossplot(library_ms, params, highlight_id=None):
     """Core k vs PNM k (multi-sample, log-log)."""
     params = params or DEFAULT_PARAMS
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
 
     rows = []
     for s in samples:
@@ -6582,10 +7034,10 @@ def fig_ms_k_pnm_crossplot(library, params, highlight_id=None):
     return fig
 
 
-def fig_ms_ci_log(library, params, highlight_id=None):
+def fig_ms_ci_log(library_ms, params, highlight_id=None):
     """Connectivity index log track: log10(k_PNM/k_core) vs depth (DEPTH on Y, increasing downward)."""
     params = params or DEFAULT_PARAMS
-    samples = _iter_samples(library)
+    samples = _iter_samples(library_ms)
 
     rows = []
     for s in samples:
@@ -7683,6 +8135,17 @@ def make_layout() -> dbc.Container:
                                                         dashGridOptions={
                                                             "rowSelection": "single",
                                                             "animateRows": True,
+                                                            # Shade discarded / excluded samples in yellow
+                                                            "getRowStyle": {
+                                                                "styleConditions": [
+                                                                    {
+                                                                        # rowData uses 'exclude_from_shm' (snake_case). Using
+                                                                        # a mismatched key prevents the highlight from triggering.
+                                                                        "condition": "params.data && params.data.exclude_from_shm",
+                                                                        "style": {"backgroundColor": "#fff3cd"},
+                                                                    }
+                                                                ]
+                                                            },
                                                         },
                                                         style={"height": f"{DASHBOARD_HEIGHT_PX}px", "width": "100%"},
                                                     )
@@ -7969,7 +8432,7 @@ def make_layout() -> dbc.Container:
                         children=[
                             html.Div("External Core Logs", className="section-title"),
                             html.Div(
-                                "Import external core logs from Excel when available (e.g., LogN4A / LogN4_Vert, PorAmb/PorOB/PermAmb/PermOB, and any permeability/porosity logs you provide).",
+                                "Import LogN4A/LogN4_Vert logs (PorAmb, PorOB, PermAmb, PermOB, etc.) when available.",
                                 className="text-muted small",
                                 style={"marginBottom": "6px"},
                             ),
@@ -7979,7 +8442,7 @@ def make_layout() -> dbc.Container:
                                     dbc.Col(
                                         dcc.Upload(
                                             id="upload-logn4",
-                                            children=_btn("Import Core Logs", "btn-import-logn4-proxy", outline=False),
+                                            children=_btn("Import N4 Logs", "btn-import-logn4-proxy", outline=False),
                                             multiple=True,
                                             accept=".xlsx,.xls",
                                             style={"width": "100%"},
@@ -8811,12 +9274,14 @@ def on_remove_samples(n_open, n_confirm, n_cancel, is_open, remove_values, selec
     Input("store-current-id", "data"),
     Input("store-ui", "data"),
     Input("store-status", "data"),
+    Input("store-logn4", "data"),
     State("store-params", "data"),
 )
-def update_views(library, current_id, ui, status, params):
+def update_views(library, current_id, ui, status, logn4_store, params):
     library = library or []
     ui = ui or {"plot_mode": "intrusion", "xlog": True, "overlay_inc": False}
     params = params or DEFAULT_PARAMS
+    mode = (ui or {}).get("plot_mode", "intrusion")
 
     sample = _lib_get(library, current_id) if current_id else None
     if not sample:
@@ -8890,8 +9355,20 @@ def update_views(library, current_id, ui, status, params):
         style={"color": COLORS["text"]},
     )
 
+
+    # Multi-sample default filter: hide discarded / hard-fail samples
+    if mode == "winland" or str(mode).startswith("ms_"):
+        try:
+            library_ms = [
+                s for s in _coerce_library_list(library)
+                if not _is_excluded_sample_for_multisample(s, params)
+            ]
+        except Exception:
+            library_ms = _coerce_library_list(library)
+    else:
+        library_ms = _coerce_library_list(library)
+
     # Figure selection
-    mode = ui.get("plot_mode", "intrusion")
     if mode == "pcsw":
         fig = fig_pc_sw(df, ui)
     elif mode == "psd":
@@ -8901,36 +9378,36 @@ def update_views(library, current_id, ui, status, params):
     elif mode == "shf":
         fig = fig_shf(df, params, ui)
     elif mode == "winland":
-        fig = fig_winland_crossplot(library)
+        fig = fig_winland_crossplot(library_ms)
     elif mode == "pnm3d":
         fig = fig_pnm3d_network(df, params, meta, res, ui, sample_id=sample.get("sample_id"))
     elif mode == "ms_pc_overlay":
-        fig = fig_ms_pc_overlay(library, ui, highlight_id=current_id)
+        fig = fig_ms_pc_overlay(library_ms, ui, highlight_id=current_id)
     elif mode == "ms_psd_compare":
-        fig = fig_ms_psd_compare(library, ui, highlight_id=current_id)
+        fig = fig_ms_psd_compare(library_ms, ui, highlight_id=current_id)
     elif mode == "ms_cum_intrusion":
-        fig = fig_ms_cum_intrusion(library, ui, highlight_id=current_id)
+        fig = fig_ms_cum_intrusion(library_ms, ui, highlight_id=current_id)
     elif mode == "ms_phi_k":
-        fig = fig_ms_phi_k_crossplot(library, params, highlight_id=current_id)
+        fig = fig_ms_phi_k_crossplot(library_ms, params, highlight_id=current_id)
     elif mode == "ms_jfunc":
-        fig = fig_ms_j_function(library, params, highlight_id=current_id)
+        fig = fig_ms_j_function(library_ms, params, highlight_id=current_id)
     elif mode == "ms_g_pd":
-        fig = fig_ms_g_vs_pd(library, highlight_id=current_id)
+        fig = fig_ms_g_vs_pd(library_ms, highlight_id=current_id)
     elif mode == "ms_petro_logs":
-        fig = fig_ms_petro_logs(library, params)
+        fig = fig_ms_petro_logs(library_ms, params)
     elif mode == "ms_k_profile":
         # fig_ms_k_profile(project, mode=...) only needs the library/project dict.
         # Passing "params" here causes a server-side callback exception and makes the
         # "k Profile" button appear to do nothing.
-        fig = fig_ms_k_profile(library, mode=ui.get("kprof_mode", "logk"), fill_models=bool(ui.get("kprof_fill", False)))
+        fig = fig_ms_k_profile(library_ms, mode=ui.get("kprof_mode", "logk"), fill_models=bool(ui.get("kprof_fill", False)), logn4_store=logn4_store)
     elif mode == "ms_hfu":
-        fig = fig_ms_hfu_log(library, params)
+        fig = fig_ms_hfu_log(library_ms, params)
     elif mode == "ms_shm":
-        fig = fig_ms_shm_curves(library, params, ui)
+        fig = fig_ms_shm_curves(library_ms, params, ui)
     elif mode == "ms_k_pnm":
-        fig = fig_ms_k_pnm_crossplot(library, params, highlight_id=current_id)
+        fig = fig_ms_k_pnm_crossplot(library_ms, params, highlight_id=current_id)
     elif mode == "ms_ci_log":
-        fig = fig_ms_ci_log(library, params, highlight_id=current_id)
+        fig = fig_ms_ci_log(library_ms, params, highlight_id=current_id)
     else:
         fig = fig_intrusion(df, ui)
 
@@ -9014,22 +9491,23 @@ def update_views(library, current_id, ui, status, params):
                         yshift=26,
                     )
                 )
-
             # Pd (Thomeer displacement pressures used in current model)
-            if res.get("thomeer_mode") == "bimodal":
-                pd1_line = float(res.get("thomeer_pd1_psia", np.nan))
-                pd2_line = float(res.get("thomeer_pd2_psia", np.nan))
-                if np.isfinite(pd1_line) and pd1_line > 0:
-                    fig.add_vline(x=pd1_line, line_width=2, line_dash="dot", line_color="deepskyblue")
-                    fig.add_annotation(x=pd1_line, y=y_max, text="Pd1", showarrow=False, yshift=10, font=dict(color="deepskyblue"))
-                if np.isfinite(pd2_line) and pd2_line > 0:
-                    fig.add_vline(x=pd2_line, line_width=2, line_dash="dot", line_color="violet")
-                    fig.add_annotation(x=pd2_line, y=y_max, text="Pd2", showarrow=False, yshift=22, font=dict(color="violet"))
-            else:
-                pd_line = float(res.get("thomeer_pd_psia", np.nan))
-                if np.isfinite(pd_line) and pd_line > 0:
-                    fig.add_vline(x=pd_line, line_width=2, line_dash="dot", line_color="deepskyblue")
-                    fig.add_annotation(x=pd_line, y=y_max, text="Pd", showarrow=False, yshift=10, font=dict(color="deepskyblue"))
+            th_mode = (res.get("thomeer_mode") or "").strip().lower() if isinstance(res, dict) else ""
+            if th_mode in ("bimodal", "unimodal") and plot_mode in ("intrusion", "pcsw", "thomeer"):
+                if th_mode == "bimodal":
+                    pd1_line = _num(res.get("thomeer_pd1_psia"))
+                    pd2_line = _num(res.get("thomeer_pd2_psia"))
+                    if pd1_line is not None and pd1_line > 0:
+                        shapes.append(dict(type="line", xref="x", yref="paper", x0=pd1_line, x1=pd1_line, y0=0, y1=1, line=dict(color="deepskyblue", width=2, dash="dot"), editable=False))
+                        annots.append(dict(x=pd1_line, y=1.0, yref="paper", text="Pd1", showarrow=False, font=dict(color="deepskyblue", size=12), yshift=10))
+                    if pd2_line is not None and pd2_line > 0:
+                        shapes.append(dict(type="line", xref="x", yref="paper", x0=pd2_line, x1=pd2_line, y0=0, y1=1, line=dict(color="violet", width=2, dash="dot"), editable=False))
+                        annots.append(dict(x=pd2_line, y=1.0, yref="paper", text="Pd2", showarrow=False, font=dict(color="violet", size=12), yshift=22))
+                else:
+                    pd_line = _num(res.get("thomeer_pd_psia"))
+                    if pd_line is not None and pd_line > 0:
+                        shapes.append(dict(type="line", xref="x", yref="paper", x0=pd_line, x1=pd_line, y0=0, y1=1, line=dict(color="deepskyblue", width=2, dash="dot"), editable=False))
+                        annots.append(dict(x=pd_line, y=1.0, yref="paper", text="Pd", showarrow=False, font=dict(color="deepskyblue", size=12), yshift=10))
             # Backbone / Fractal proxy line
             if bb_psia is not None and np.isfinite(bb_psia) and bb_psia > 0:
                 shapes.append(
@@ -9056,9 +9534,9 @@ def update_views(library, current_id, ui, status, params):
                         yshift=54,
                     )
                 )
-
             if shapes:
-                fig.update_layout(shapes=shapes)
+                existing_shapes = list(fig.layout.shapes) if getattr(fig.layout, "shapes", None) else []
+                fig.update_layout(shapes=existing_shapes + shapes)
                 for a in annots:
                     fig.add_annotation(**a)
         except Exception:
@@ -11699,7 +12177,7 @@ def on_core_validation_table(library, current_id, logn4_store, selected_sheet):
 
     notes = []
     if sheet_used is None:
-        notes.append("Import External N4 Logs to compute PermAmb/PermOB (stress sensitivity).")
+        notes.append("Import External Core Logs to compute PermAmb/PermOB (stress sensitivity).")
     else:
         if depth_used is not None:
             if depth_delta is None:
@@ -11742,5 +12220,3 @@ if __name__ == "__main__":
     debug = os.environ.get("DASH_DEBUG", "0").strip() in {"1", "true", "True"}
     port = int(os.environ.get("PORT", "8050"))
     app.run(debug=debug, host="127.0.0.1", port=port)
-
-server = app.server
