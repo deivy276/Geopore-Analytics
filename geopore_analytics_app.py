@@ -65,7 +65,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-VERSION = '1.8.25.6'
+VERSION = '1.8.25.10'
 # Base dashboard (plot/grid) height in px — requested 1.75× increase over prior 640px
 DASHBOARD_HEIGHT_PX = int(640 * 1.75)  # = 1120px
 
@@ -1652,6 +1652,22 @@ def _try_float(x: Any) -> Optional[float]:
         return float(s)
     except Exception:
         return None
+
+
+# -----------------------------------------------------------------------------
+# Small numeric helper
+# -----------------------------------------------------------------------------
+# Some parts of the app historically used a helper named `_num()` to coerce
+# values to floats (returning None if not possible). During refactors, several
+# call-sites kept using `_num()` even though it no longer existed at module
+# scope. Those blocks often sit inside broad try/except guards, which means the
+# failure is silent but user-visible (e.g., missing Closure / Conformance / Pd
+# vertical reference lines in plots).
+#
+# Keeping this tiny alias makes the code robust and prevents silent feature
+# loss.
+def _num(x: Any) -> Optional[float]:
+    return _try_float(x)
 
 def _find_row_col(df: pd.DataFrame, pattern: str, max_scan_rows: int = 500) -> Optional[Tuple[int, int, str]]:
     pat = re.compile(pattern, re.IGNORECASE)
@@ -6260,6 +6276,22 @@ def fig_ms_k_profile(library, mode: str = "logk", fill_models: bool = False, log
     if profiles is None or profiles.empty:
         return _empty_fig("No k profile data available.")
 
+    # Robustness: some older project files / external log merges can produce a profiles table without
+    # an explicit sample_id column. Create one so multi-sample plotting never crashes.
+    if isinstance(profiles, pd.DataFrame) and "sample_id" not in profiles.columns:
+        # If the sample identifier is stored as an index, bring it back as a column
+        if getattr(profiles.index, "name", None) in ("sample_id", "sample", "sample_name"):
+            profiles = profiles.reset_index()
+        # Common alternative column names
+        if "sample_id" not in profiles.columns:
+            for _alt in ("sample", "sample_name", "name", "Sample", "SAMPLE", "id", "sample_label"):
+                if _alt in profiles.columns:
+                    profiles["sample_id"] = profiles[_alt].astype(str)
+                    break
+        if "sample_id" not in profiles.columns:
+            profiles["sample_id"] = ""
+
+
     # --- Column map (DataFrame column names) ---
     keymap = {
         "Core k": "k_core_md",
@@ -8362,27 +8394,6 @@ def make_layout() -> dbc.Container:
                                         ],
                                     ),
                                     dbc.Row(
-                                        className="g-2 align-items-center mb-2",
-                                        children=[
-                                            dbc.Col(
-                                                html.Div("Fill", className="text-muted", style={"fontSize": "0.90rem"}),
-                                                width=4,
-                                            ),
-                                            dbc.Col(
-                                                dcc.Checklist(
-                                                    id="chk-kprof-fill",
-                                                    options=[{"label": "Enable shaded fill", "value": "fill"}],
-                                                    # Use init_ui here (make_layout scope). "ui" is only available inside callbacks.
-                                                    value=["fill"] if init_ui.get("kprof_fill") else [],
-                                                    labelStyle={"display": "inline-block", "marginRight": "14px", "color": "#ffffff"},
-                                                    inputStyle={"marginRight": "6px"},
-                                                    style={"color": "#ffffff"},
-                                                ),
-                                                width=8,
-                                            ),
-                                        ],
-                                    ),
-                                    dbc.Row(
                                         className="g-2",
                                         children=[
                                             dbc.Col(_btn("Log/Lin X", "btn-toggle-xlog", outline=True), width=6),
@@ -9168,18 +9179,6 @@ def _sync_kprof_mode_dropdown(ui):
 
 
 @app.callback(
-    Output("store-ui", "data", allow_duplicate=True),
-    Input("chk-kprof-fill", "value"),
-    State("store-ui", "data"),
-    prevent_initial_call=True,
-)
-def _sync_kprof_fill(values, ui):
-    ui = dict(ui or {})
-    ui["kprof_fill"] = bool(values) and ("fill" in (values or []))
-    return ui
-
-
-@app.callback(
     Output("store-current-id", "data", allow_duplicate=True),
     Input("sel-sample", "value"),
     prevent_initial_call=True,
@@ -9399,7 +9398,7 @@ def update_views(library, current_id, ui, status, logn4_store, params):
         # fig_ms_k_profile(project, mode=...) only needs the library/project dict.
         # Passing "params" here causes a server-side callback exception and makes the
         # "k Profile" button appear to do nothing.
-        fig = fig_ms_k_profile(library_ms, mode=ui.get("kprof_mode", "logk"), fill_models=bool(ui.get("kprof_fill", False)), logn4_store=logn4_store)
+        fig = fig_ms_k_profile(library_ms, mode=ui.get("kprof_mode", "logk"), fill_models=False, logn4_store=logn4_store)
     elif mode == "ms_hfu":
         fig = fig_ms_hfu_log(library_ms, params)
     elif mode == "ms_shm":
@@ -9413,14 +9412,33 @@ def update_views(library, current_id, ui, status, logn4_store, params):
 
     # Closure/Conformance marker (draggable vertical line)
     # NOTE: Draggable behavior comes from dcc.Graph(config=GRAPH_CONFIG) and the shape below.
-    conf_pk = res.get("conf_pknee_psia")
+    # Keep this numeric to avoid np.isfinite(...) throwing on strings.
+    conf_pk = _num(res.get("conf_pknee_psia"))
     conf_applied = bool(res.get("conf_applied"))
     
     # --- Reference vertical lines (Conformance, Threshold, Pd, Backbone) ---
     if mode in ("intrusion", "pcsw", "thomeer"):
         try:
+            bottom_parts = []
             shapes = []
             annots = []
+            def _fmt_psi(v):
+                try:
+                    v = float(v)
+                except Exception:
+                    return None
+                if not np.isfinite(v) or v <= 0:
+                    return None
+                if v < 10:
+                    return f"{v:.3f}"
+                if v < 100:
+                    return f"{v:.2f}"
+                if v < 1000:
+                    return f"{v:.1f}"
+                if v < 10000:
+                    return f"{v:.1f}"
+                return f"{v:.0f}"
+
 
             # Conformance (data cleaning) line
             conf_line = conf_pk
@@ -9457,6 +9475,7 @@ def update_views(library, current_id, ui, status, logn4_store, params):
                         yshift=12,
                     )
                 )
+                bottom_parts.append(f"Conformance={_fmt_psi(conf_line)} psi")
 
             # Threshold (Pth) line (entry into connected pore network)
             pth_line = None
@@ -9466,6 +9485,7 @@ def update_views(library, current_id, ui, status, logn4_store, params):
                 pth_line = meta.get("threshold_pressure_psia") if meta else None
             if (pth_line is None) and (df is not None):
                 pth_line, _pth_info = compute_threshold_pressure_psia(df, params)
+            pth_line = _num(pth_line)
             if pth_line is not None and np.isfinite(pth_line) and pth_line > 0:
                 shapes.append(
                     dict(
@@ -9491,32 +9511,46 @@ def update_views(library, current_id, ui, status, logn4_store, params):
                         yshift=26,
                     )
                 )
-            # Pd (Thomeer displacement pressures used in current model)
-            th_mode = (res.get("thomeer_mode") or "").strip().lower() if isinstance(res, dict) else ""
-            if th_mode in ("bimodal", "unimodal") and plot_mode in ("intrusion", "pcsw", "thomeer"):
-                if th_mode == "bimodal":
-                    pd1_line = _num(res.get("thomeer_pd1_psia"))
-                    pd2_line = _num(res.get("thomeer_pd2_psia"))
-                    if pd1_line is not None and pd1_line > 0:
-                        shapes.append(dict(type="line", xref="x", yref="paper", x0=pd1_line, x1=pd1_line, y0=0, y1=1, line=dict(color="deepskyblue", width=2, dash="dot"), editable=False))
-                        annots.append(dict(x=pd1_line, y=1.0, yref="paper", text="Pd1", showarrow=False, font=dict(color="deepskyblue", size=12), yshift=10))
-                    if pd2_line is not None and pd2_line > 0:
-                        shapes.append(dict(type="line", xref="x", yref="paper", x0=pd2_line, x1=pd2_line, y0=0, y1=1, line=dict(color="violet", width=2, dash="dot"), editable=False))
-                        annots.append(dict(x=pd2_line, y=1.0, yref="paper", text="Pd2", showarrow=False, font=dict(color="violet", size=12), yshift=22))
-                else:
-                    pd_line = _num(res.get("thomeer_pd_psia"))
-                    if pd_line is not None and pd_line > 0:
-                        shapes.append(dict(type="line", xref="x", yref="paper", x0=pd_line, x1=pd_line, y0=0, y1=1, line=dict(color="deepskyblue", width=2, dash="dot"), editable=False))
-                        annots.append(dict(x=pd_line, y=1.0, yref="paper", text="Pd", showarrow=False, font=dict(color="deepskyblue", size=12), yshift=10))
+                bottom_parts.append(f"Pth={_fmt_psi(pth_line)} psi")
+            # Pd (Thomeer displacement pressures)
+            # Show these markers across modes (including auto_fixed_pd) because users
+            # need consistent reference lines in Intrusion / Inc-Cum and Thomeer.
+            th_mode = (
+                (res.get("thomeer_mode") or res.get("thomeer_mode_used") or res.get("thomeer_mode_fit") or "")
+                .strip()
+                .lower()
+                if isinstance(res, dict)
+                else ""
+            )
+
+            if th_mode == "bimodal":
+                pd1_line = _num(res.get("thomeer_pd1_psia") or res.get("thomeer_pd1"))
+                pd2_line = _num(res.get("thomeer_pd2_psia") or res.get("thomeer_pd2"))
+                if pd1_line is not None and np.isfinite(pd1_line) and pd1_line > 0:
+                    shapes.append(dict(type="line", xref="x", yref="paper", x0=pd1_line, x1=pd1_line, y0=0, y1=1, line=dict(color="deepskyblue", width=2, dash="dot"), editable=False))
+                    annots.append(dict(x=pd1_line, y=1.0, yref="paper", text="Pd1", showarrow=False, font=dict(color="deepskyblue", size=12), yshift=10))
+                    bottom_parts.append(f"Pd1={_fmt_psi(pd1_line)} psi")
+                if pd2_line is not None and np.isfinite(pd2_line) and pd2_line > 0:
+                    shapes.append(dict(type="line", xref="x", yref="paper", x0=pd2_line, x1=pd2_line, y0=0, y1=1, line=dict(color="violet", width=2, dash="dot"), editable=False))
+                    annots.append(dict(x=pd2_line, y=1.0, yref="paper", text="Pd2", showarrow=False, font=dict(color="violet", size=12), yshift=22))
+                    bottom_parts.append(f"Pd2={_fmt_psi(pd2_line)} psi")
+            else:
+                # For auto_fixed_pd / unimodal / etc, prefer thomeer_pd_psia then fall back to pd1.
+                pd_line = _num(res.get("thomeer_pd_psia") or res.get("thomeer_pd1_psia") or res.get("pd_psia"))
+                if pd_line is not None and np.isfinite(pd_line) and pd_line > 0:
+                    shapes.append(dict(type="line", xref="x", yref="paper", x0=pd_line, x1=pd_line, y0=0, y1=1, line=dict(color="deepskyblue", width=2, dash="dot"), editable=False))
+                    annots.append(dict(x=pd_line, y=1.0, yref="paper", text="Pd", showarrow=False, font=dict(color="deepskyblue", size=12), yshift=10))
+                    bottom_parts.append(f"Pd={_fmt_psi(pd_line)} psi")
             # Backbone / Fractal proxy line
-            if bb_psia is not None and np.isfinite(bb_psia) and bb_psia > 0:
+            bb_line = _num(bb_psia)
+            if bb_line is not None and np.isfinite(bb_line) and bb_line > 0:
                 shapes.append(
                     dict(
                         type="line",
                         xref="x",
                         yref="paper",
-                        x0=bb_psia,
-                        x1=bb_psia,
+                        x0=bb_line,
+                        x1=bb_line,
                         y0=0,
                         y1=1,
                         line=dict(color="magenta", width=2, dash="solid"),
@@ -9525,7 +9559,7 @@ def update_views(library, current_id, ui, status, logn4_store, params):
                 )
                 annots.append(
                     dict(
-                        x=bb_psia,
+                        x=bb_line,
                         y=1.0,
                         yref="paper",
                         text="Backbone",
@@ -9534,11 +9568,52 @@ def update_views(library, current_id, ui, status, logn4_store, params):
                         yshift=54,
                     )
                 )
+                bottom_parts.append(f"Backbone={_fmt_psi(bb_line)} psi")
             if shapes:
                 existing_shapes = list(fig.layout.shapes) if getattr(fig.layout, "shapes", None) else []
                 fig.update_layout(shapes=existing_shapes + shapes)
                 for a in annots:
                     fig.add_annotation(**a)
+
+
+                # Show numeric pressure readout (below plot) for the vertical marker lines
+                if mode in ("intrusion", "thomeer") and bottom_parts:
+                    # Drop Nones (should not happen)
+                    bottom_parts = [p for p in bottom_parts if p]
+                    if bottom_parts:
+                        # Wrap into up to two lines so it stays readable
+                        if len(bottom_parts) <= 3:
+                            bottom_text = " | ".join(bottom_parts)
+                        elif len(bottom_parts) == 4:
+                            bottom_text = " | ".join(bottom_parts[:2]) + "<br>" + " | ".join(bottom_parts[2:])
+                        else:
+                            bottom_text = " | ".join(bottom_parts[:3]) + "<br>" + " | ".join(bottom_parts[3:])
+
+                        # Ensure we have enough bottom space
+                        try:
+                            mb = getattr(getattr(fig.layout, "margin", None), "b", 0) or 0
+                        except Exception:
+                            mb = 0
+                        fig.update_layout(margin=dict(b=max(mb, 170)))
+
+                        # Keep legend above the pressure readout
+                        try:
+                            fig.update_layout(legend=dict(orientation="h", x=0.0, xanchor="left", y=-0.10, yanchor="top"))
+                        except Exception:
+                            pass
+
+                        fig.add_annotation(
+                            xref="paper",
+                            yref="paper",
+                            x=0.5,
+                            y=-0.23,
+                            text=bottom_text,
+                            showarrow=False,
+                            xanchor="center",
+                            yanchor="top",
+                            align="center",
+                            font=dict(size=11, color="rgba(255,255,255,0.85)"),
+                        )
         except Exception:
             pass
     # If correction applied, optionally overlay the original (raw) cumulative curve for reference (intrusion plot only)
